@@ -18,4 +18,4 @@ jobs:
 
       - uses: imjasonh/setup-ko@v0.6
 
-      - run: ko build
+      - run: ko build --base-import-paths
