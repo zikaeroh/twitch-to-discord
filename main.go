@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
-	"log"
+	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -12,20 +15,24 @@ import (
 	"github.com/ergochat/irc-go/ircevent"
 	"github.com/ergochat/irc-go/ircmsg"
 	"github.com/goccy/go-yaml"
+	"golang.org/x/exp/slog"
 )
 
-type Config struct {
-	Users []*User `json:"users"`
-	Rules []*Rule `json:"rules"`
+type config struct {
+	Users      []*user `json:"users"`
+	Rules      []*rule `json:"rules"`
+	WebhookURL string  `json:"webhook_url"`
 }
 
-type User struct {
+type user struct {
 	Nick     string   `json:"nick"`
 	Pass     string   `json:"pass"`
 	Channels []string `json:"channels"`
 }
 
-type Rule struct {
+type rule struct {
+	Name string `json:"name"`
+
 	Channel string `json:"channel"`
 	channel *regexp.Regexp
 	Sender  string `json:"sender"`
@@ -34,27 +41,33 @@ type Rule struct {
 	message *regexp.Regexp
 }
 
-type Webhook struct {
-	Username  string `json:"username"`
-	AvatarURL string `json:"avatar_url"`
-	Content   string `json:"content"`
+type webhook struct {
+	Username string `json:"username,omitempty"`
+	Content  string `json:"content,omitempty"`
 }
-
-const joinDelay = time.Second
 
 var configPath = flag.String("config", "", "path to config")
 
 func main() {
+	slog.Info("starting")
+
 	flag.Parse()
+
+	if *configPath == "" {
+		slog.Error("missing config file", nil)
+		os.Exit(1)
+	}
 
 	configBytes, err := os.ReadFile(*configPath)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("error reading config", err)
+		os.Exit(1)
 	}
 
-	var config Config
+	var config config
 	if err := yaml.Unmarshal(configBytes, &config); err != nil {
-		log.Fatal(err)
+		slog.Error("error decoding config", err)
+		os.Exit(1)
 	}
 
 	for _, rule := range config.Rules {
@@ -79,34 +92,46 @@ func main() {
 				continue
 			}
 
-			log.Println(channel, sender, message)
+			var buf bytes.Buffer
+			_ = json.NewEncoder(&buf).Encode(&webhook{
+				Username: "Twitch - " + rule.Name,
+				Content:  fmt.Sprintf("%s@%s: %s", sender, channel, message),
+			})
+
+			_, err := http.Post(config.WebhookURL, "application/json", &buf)
+			if err != nil {
+				slog.Error("error POSTing webhook", err)
+			}
+			return
 		}
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(len(config.Users))
 
-	runOne := func(user *User) {
+	runOne := func(u *user) {
 		defer wg.Done()
 
 		irc := ircevent.Connection{
 			Server:      "irc.chat.twitch.tv:6697",
 			UseTLS:      true,
-			Nick:        user.Nick,
-			Password:    user.Pass,
+			Nick:        u.Nick,
+			Password:    u.Pass,
 			RequestCaps: []string{"twitch.tv/commands", "twitch.tv/tags"},
 		}
 
 		irc.AddConnectCallback(func(e ircmsg.Message) {
-			for _, c := range user.Channels {
+			for _, c := range u.Channels {
 				if !strings.HasPrefix(c, "#") {
 					c = "#" + c
 				}
 
 				if err := irc.Join(c); err != nil {
-					log.Fatal(err)
+					slog.Error("error joining channel", err)
+					os.Exit(1)
 				}
-				time.Sleep(joinDelay)
+
+				time.Sleep(time.Second)
 			}
 		})
 
@@ -114,7 +139,8 @@ func main() {
 
 		err := irc.Connect()
 		if err != nil {
-			log.Fatal(err)
+			slog.Error("error connecting to irc", err)
+			os.Exit(1)
 		}
 		irc.Loop()
 	}
